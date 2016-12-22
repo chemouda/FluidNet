@@ -16,8 +16,6 @@ local nn = require('nn')
 local cudnn = require('cudnn')
 
 local inPlaceReLU = true
--- For ReLU6 you'll have to clone my fork of nn and cunn (relu6 branch).
-local nonlinType = 'relu'  -- Choices are: 'relu', 'relu6', 'sigmoid'.
 
 -- This is the step size for the FEM approximation of gradP. We will verify
 -- this step size against the training data during model instantiation.
@@ -93,14 +91,14 @@ function torch.defineModelGraph(conf, mconf, data)
   -- Some helper functions.
   local function addNonlinearity(input)
     local nonlin
-    if nonlinType == 'relu6' then
+    if mconf.nonlinType == 'relu6' then
       nonlin = nn.ReLU6(inPlaceReLU)
-    elseif nonlinType == 'relu' then
+    elseif mconf.nonlinType == 'relu' then
       nonlin = nn.ReLU(inPlaceReLU)
-    elseif nonlinType == 'sigmoid' then
+    elseif mconf.nonlinType == 'sigmoid' then
       nonlin = nn.Sigmoid()
     else
-      error('Bad nonlinType.')
+      error('Bad mconf.nonlinType (' .. mconf.nonlinType .. ').')
     end
     print('Adding non-linearity: ' .. nonlin:__tostring() .. ' (inplace ' ..
           tostring(inPlaceReLU) .. ')')
@@ -133,26 +131,70 @@ function torch.defineModelGraph(conf, mconf, data)
     print('Adding batch norm: ' .. bn:__tostring__())
     return bn(input)
   end
-  local function addConv(input, ifeats, ofeats, k, up)
+
+  -- @param interFeats - feature size of the intermediate layers when
+  -- creating a low rank approximation.
+  local function addConv(input, ifeats, ofeats, k, up, rank, interFeats)
+    if rank == nil then
+      assert(interFeats == nil)
+      if mconf.twoDim then
+        rank = 2  -- Default is full rank.
+      else
+        rank = 3  -- Default is full rank.
+      end
+    end
     assert(math.fmod(k, 2) == 1, 'convolution size must be odd')
     local pad = (k - 1) / 2
     local conv
     if mconf.twoDim then
       if up > 1 then
+        assert(rank == 2, 'Upsampling layers must be full rank')
         conv = nn.SpatialConvolutionUpsample(
             ifeats, ofeats, k, k, 1, 1, pad, pad, up, up)
         cudnn.convert(conv, cudnn)  -- Convert the inner convolution to cudnn.
       else
-        conv = cudnn.SpatialConvolution(ifeats, ofeats, k, k, 1, 1, pad, pad)
+        if rank == 1 then
+          conv = nn.Sequential()
+          conv:add(cudnn.SpatialConvolution(
+              ifeats, interFeats, k, 1, 1, 1, pad, 0))
+          conv:add(cudnn.SpatialConvolution(
+              interFeats, ofeats, 1, k, 1, 1, 0, pad))
+        elseif rank == 2 then
+          conv = cudnn.SpatialConvolution(ifeats, ofeats, k, k, 1, 1, pad, pad)
+        else
+          error('rank ' .. rank .. ' is invalid (1 or 2)')
+        end
       end
     else
       if up > 1 then
+        assert(rank == 3, 'Upsampling layers must be full rank')
         conv = nn.VolumetricConvolutionUpsample(
             ifeats, ofeats, k, k, k, 1, 1, 1, pad, pad, pad, up, up, up)
         cudnn.convert(conv, cudnn)  -- Convert the inner convolution to cudnn.
       else
-        conv = cudnn.VolumetricConvolution(ifeats, ofeats, k, k, k, 1, 1, 1,
-                                           pad, pad, pad)
+        if rank == 1 then
+          -- There are LOTS of ways of partitioning the 3D conv into a low rank
+          -- approximation (order, number of features, etc).
+          -- We're just going to arbitrarily choose just one low rank approx.
+          conv = nn.Sequential()
+          conv:add(cudnn.VolumetricConvolution(
+              ifeats, interFeats, k, 1, 1, 1, 1, 1, pad, 0, 0))
+          conv:add(cudnn.VolumetricConvolution(
+              interFeats, interFeats, 1, k, 1, 1, 1, 1, 0, pad, 0))
+          conv:add(cudnn.VolumetricConvolution(
+              interFeats, ofeats, 1, 1, k, 1, 1, 1, 0, 0, pad))
+        elseif rank == 2 then
+          conv = nn.Sequential()
+          conv:add(cudnn.VolumetricConvolution(
+              ifeats, interFeats, k, k, 1, 1, 1, 1, pad, pad, 0))
+          conv:add(cudnn.VolumetricConvolution(
+              interFeats, ofeats, 1, k, k, 1, 1, 1, 0, pad, pad))
+        elseif rank == 3 then
+          conv = cudnn.VolumetricConvolution(
+              ifeats, ofeats, k, k, k, 1, 1, 1, pad, pad, pad)
+        else
+          error('rank ' .. rank .. ' is invalid (1, 2 or 3)')
+        end
       end
     end
     print('Adding convolution: ' .. conv:__tostring__())
@@ -198,6 +240,8 @@ function torch.defineModelGraph(conf, mconf, data)
     ksize = {5, 5, 5, 5, 1, 1}  -- Conv filter size.
     psize = {2, 1, 1, 1, 1, 1}  -- pooling decimation size (1: no pooling)
     usize = {1, 1, 1, 1, 1, 1}  -- upsampling size (1 == no upsampling).
+    rank = {2, 2, 2, 2, 2, 2}
+    interFeats = {nil, nil, nil, nil, nil, nil}
 
     -- The last layer is somewhat special (since the number of osize is always
     -- 1, we don't ever do pooling and we may or may not concatenate the input
@@ -235,6 +279,8 @@ function torch.defineModelGraph(conf, mconf, data)
     ksize = {3, 3, 3, 3, 1, 1}
     psize = {2, 2, 1, 1, 1, 1}
     usize = {1, 1, 1, 1, 1, 2}
+    rank = {3, 3, 3, 3, 3, 3}
+    interFeats = {nil, nil, nil, nil, nil, nil}
     lastLayerKSize = 3
     lastLayerUSize = 2
   end
@@ -244,7 +290,8 @@ function torch.defineModelGraph(conf, mconf, data)
     if psize[lid] > 1 then
       assert(usize[lid] == 1, 'Pooling and upsampling in the same layer!')
     end
-    hl = addConv(hl, inDims, osize[lid], ksize[lid], usize[lid])
+    hl = addConv(hl, inDims, osize[lid], ksize[lid], usize[lid], rank[lid],
+                 interFeats[lid])
     hl = addNonlinearity(hl)
     if psize[lid] > 1 then
       hl = addPooling(hl, psize[lid])
@@ -261,7 +308,7 @@ function torch.defineModelGraph(conf, mconf, data)
     inDims = inDims + 1
   end
 
-  -- Output pressure (1 slice): final conv layer.
+  -- Output pressure (1 slice): final conv layer. (full rank)
   p = addConv(hl, inDims, 1, lastLayerKSize, lastLayerUSize)
 
   -- Final output nodes.
